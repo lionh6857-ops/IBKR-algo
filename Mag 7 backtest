@@ -1,0 +1,607 @@
+"""
+MAG 7 COVERED-CALL / BUY-WRITE BACKTESTER
+================================================================================
+Modeled from the Latest live paper-trading engine's actual strategy rules
+(the version with delta-targeted strikes, an 80%-profit-capture exit, a
+20%-of-entry-DTE backstop, and cash-only even-split sizing — NOT the older
+EOD-flatten-everything version). Every rule below is a direct match to latest
+live engine's own logic; see the per-rule notes for exactly which live-engine
+method each piece of this file is reproducing.
+ 
+Backtest window: 2022-07-05 -> 2026-09-18
+Starting capital: $249,000.00 (lump cash sum available on day 1, 2022-07-05)
+Candidate universe: Magnificent Seven only — AAPL, MSFT, GOOGL, AMZN, META,
+NVDA, TSLA — matching the live engine's CANDIDATE_UNIVERSE exactly.
+ 
+READ THIS BEFORE TRUSTING ANY NUMBER THIS PRINTS:
+ 
+1. IBKR's API does not provide historical bid/ask quotes for expired option
+   contracts, so option prices here are NOT real historical quotes — they
+   are Black-Scholes model prices using a rolling REALIZED volatility
+   computed from each stock's own daily returns (implied vol for expired
+   chains isn't available historically either). Real option prices differ
+   from BS-modeled prices in ways that matter (skew, term structure,
+   supply/demand at that specific strike) — a structural limitation of any
+   backtest built this way, not a bug to fix later.
+ 
+2. Strikes are theoretical (the real-valued analytical result of
+   solve_strike_for_target_delta, targeting TARGET_DELTA=0.25 — same
+   function and same target as the live engine's finalize_target_contract()),
+   not real listed strike increments — there's no historical chain to snap
+   to, so nothing rounds to the nearest $5 or $10 strike the way a real
+   fill would.
+ 
+3. Not modeled at all: commissions, slippage, bid/ask spread on fills,
+   dividends (covered calls forgo dividend upside on assignment), and true
+   early exercise by the option holder.
+ 
+4. NO END-OF-DAY FLATTEN. This is the key difference from an older version
+   of this backtest: the live engine no longer force-closes everything at
+   market close. A position, once opened, is held across as many days as it
+   takes to hit ONE of three live-engine exits (checked in this exact order,
+   matching monitor_exit_targets()/monitor_leg_exit_targets()):
+     a) DTE BACKSTOP — remaining days-to-expiry has fallen to
+        DTE_BACKSTOP_PCT (20%) of the DTE it had when opened. Force-closes
+        regardless of P&L.
+     b) PROFIT CAPTURE — the option's modeled value has decayed to
+        (1 - PROFIT_CAPTURE_PCT) = 20% of the entry credit.
+     c) STOP LOSS — the option's modeled value has grown to
+        STOP_LOSS_MULTIPLE (2.0x) the entry credit.
+   Positions can and do span multiple trading days, sometimes weeks, exactly
+   as they would live.
+ 
+5. RECYCLE, NOT ROLL: whenever a position closes for any reason above, the
+   shares are ALSO SOLD, exactly like the live engine's
+   recycle_symbol_after_close() — this is not a typical buy-write backtest
+   that holds shares through expiration and only sells on assignment. Every
+   exit is a full round-trip (stock + option), realizing a fresh stock
+   capital gain/loss every cycle, not just option premium.
+ 
+6. CASH-ONLY, EVEN SPLIT: every new buy-write is sized from ACTUAL
+   AVAILABLE CASH ONLY — never margin, never more than 100% of cash
+   deployed — split evenly across however many symbols still qualify as
+   candidates are worked down the ranked list that day, exactly matching
+   attempt_new_buy_write()'s `allocation = cash_remaining / candidates_remaining`
+   logic (candidates_remaining decrements once per candidate tried,
+   including skipped ones, whether or not a trade was actually placed).
+ 
+7. THE DAILY RISK BREAKER FREEZES EVERYTHING, NOT JUST NEW ENTRIES. This is
+   a correction versus an earlier version of this backtest. In the live
+   code, once max_daily_drawdown_pct (8%) or max_daily_markup_pct (15%) is
+   breached, self.system_halted is set True — and tickPrice()/
+   tickOptionComputation() both return immediately whenever system_halted
+   is True. That means EVERY subsequent market-data callback that day is
+   dropped, which freezes not just new position opens but also exit
+   monitoring on positions already open — they just sit marked-to-market,
+   untouched, until the flag clears. The live engine only ever clears
+   system_halted by restarting the process, which in practice happens once
+   a day (the engine shuts down at 16:00 and is started fresh each
+   morning) — so this backtest treats the breaker as reset once per
+   trading day, and on a halted day skips BOTH new entries AND managing
+   existing positions, matching that behavior. Because daily bars don't
+   give an intraday sequence of events, the breach is checked using each
+   day's opening mark (yesterday's close vs. today's close, before any of
+   today's management) — the earliest point a daily-bar simulation can
+   detect it — rather than mid-day. This is a defensible approximation
+   given the data, not a literal event-by-event replay.
+ 
+Use this to sanity-check the STRATEGY RULES the live engine actually runs,
+not as a promise of real-world P&L.
+"""
+ 
+import sys
+import os
+import json
+import math
+import csv
+import time
+import statistics
+from datetime import date, timedelta
+from statistics import NormalDist
+ 
+from ibapi.client import EClient
+from ibapi.wrapper import EWrapper
+from ibapi.contract import Contract
+ 
+# =====================================================================
+# CONFIG — every strategy constant here is a direct match to the live
+# engine's own constants of the same name/purpose.
+# =====================================================================
+BACKTEST_START = date(2022, 7, 5)
+BACKTEST_END = date(2026, 9, 18)
+STARTING_CAPITAL = 249_000.0
+ 
+VOL_WARMUP_CALENDAR_DAYS = 60     # extra history fetched before BACKTEST_START so realized vol exists on day 1
+REALIZED_VOL_WINDOW = 20          # trading days used for the rolling annualized volatility proxy (stands in for implied vol)
+RISK_FREE_RATE = 0.05
+TRADING_DAYS_PER_CALENDAR_DAY = 1 / 1.45   # rough US-market trading-day density, used to convert calendar-day expiry/DTE targets to bar-index offsets
+ 
+# 🌐 Mag 7 only — matches the live engine's CANDIDATE_UNIVERSE exactly.
+CANDIDATE_UNIVERSE = {
+    "mag7": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA"],
+}
+ 
+# 🗓️ Same target expiry window as the live engine.
+TARGET_DTE_DAYS = 30
+ 
+# 🎯 Delta-targeted strike selection — same 0.25 target and same
+# analytical solve as the live engine's solve_strike_for_target_delta(),
+# instead of a flat OTM percentage.
+TARGET_DELTA = 0.25
+ 
+# ⏳ DTE backstop — force-close once remaining calendar DTE falls to this
+# fraction of the DTE the position had when it was opened, regardless of
+# P&L. Same value and same reasoning as the live engine's DTE_BACKSTOP_PCT.
+DTE_BACKSTOP_PCT = 0.20
+ 
+# 💰 Profit-capture exit — close once the option's modeled value has
+# decayed to (1 - PROFIT_CAPTURE_PCT) of the entry credit. Same value as
+# the live engine; TAKE_PROFIT_PCT is derived the same way __init__()
+# derives self.take_profit_pct there.
+PROFIT_CAPTURE_PCT = 0.80
+TAKE_PROFIT_PCT = round(1.0 - PROFIT_CAPTURE_PCT, 4)
+STOP_LOSS_MULTIPLE = 2.0
+ 
+# 🛡️ Cash-only sizing — every new position is capped by ACTUAL cash on
+# hand, split evenly across however many symbols qualify this pass (same
+# even-split logic as the live engine's attempt_new_buy_write()). Never
+# margin. No separate per-trade cap beyond the even split itself.
+MIN_CASH_BUFFER = 0.0
+ 
+# 🎲 Daily risk breaker — see point 7 in the module docstring above for
+# why this is checked once per day, at the START of the day, and why a
+# breach freezes management of existing positions too, not just new
+# entries.
+DAILY_DRAWDOWN_HALT_PCT = 0.08
+DAILY_MARKUP_HALT_PCT = 0.15
+ 
+DATA_CACHE_PATH = r"C:\Users\Brandon.R\backtest_mag7_price_cache.json"
+TRADE_LOG_CSV_PATH = r"C:\Users\Brandon.R\backtest_mag7_trade_log.csv"
+EQUITY_CURVE_CSV_PATH = r"C:\Users\Brandon.R\backtest_mag7_equity_curve.csv"
+ 
+ 
+# =====================================================================
+# BLACK-SCHOLES + DELTA-TARGETED STRIKE SOLVE (identical math to the live
+# engine's pure_python_norm_cdf / calculate_black_scholes_value /
+# solve_strike_for_target_delta)
+# =====================================================================
+def pure_python_norm_cdf(x):
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+ 
+ 
+def calculate_black_scholes_value(stock_price, strike, days_to_expiry, risk_free_rate, volatility):
+    if stock_price <= 0 or strike <= 0 or days_to_expiry <= 0 or volatility <= 0:
+        return 0.0
+    T = days_to_expiry / 365.0
+    d1 = (math.log(stock_price / strike) + (risk_free_rate + 0.5 * volatility ** 2) * T) / (volatility * math.sqrt(T))
+    d2 = d1 - volatility * math.sqrt(T)
+    call_price = stock_price * pure_python_norm_cdf(d1) - strike * math.exp(-risk_free_rate * T) * pure_python_norm_cdf(d2)
+    return round(call_price, 4)
+ 
+ 
+def solve_strike_for_target_delta(stock_price, days_to_expiry, risk_free_rate, volatility, target_delta):
+    """Analytically solves for the call strike whose Black-Scholes delta
+    (~= N(d1)) equals target_delta — same closed-form solve as the live
+    engine's finalize_target_contract(), so the backtest picks strikes the
+    same way the live engine actually does. Falls back to a flat 2% OTM
+    strike (matching the live engine's own fallback) if the solve fails."""
+    if stock_price <= 0 or days_to_expiry <= 0 or volatility <= 0:
+        return None
+    if not (0.0 < target_delta < 1.0):
+        return None
+    T = days_to_expiry / 365.0
+    try:
+        d1 = NormalDist().inv_cdf(target_delta)
+    except (ValueError, ZeroDivisionError):
+        return None
+    try:
+        strike = stock_price / math.exp(d1 * volatility * math.sqrt(T) - (risk_free_rate + 0.5 * volatility ** 2) * T)
+    except (OverflowError, ValueError):
+        return None
+    return strike if strike > 0 else None
+ 
+ 
+# =====================================================================
+# STAGE 1: HISTORICAL DATA DOWNLOAD (the only part that touches IBKR —
+# requires TWS or IB Gateway running and logged in)
+# =====================================================================
+class HistoricalDataDownloader(EWrapper, EClient):
+    """Fetches daily close bars per symbol, chunked into ~1-year windows to
+    stay well inside IB's historical-data pacing limits, requested
+    sequentially (never more than one request in flight)."""
+ 
+    def __init__(self, symbols, range_start, range_end):
+        EClient.__init__(self, self)
+        self.bars = {sym: [] for sym in symbols}
+        self._reqid_to_symbol = {}
+        self._reqid_counter = 5000
+        self.request_queue = self._build_request_queue(symbols, range_start, range_end)
+ 
+    def _build_request_queue(self, symbols, range_start, range_end):
+        queue = []
+        for sym in symbols:
+            chunk_end = range_end
+            chunks = []
+            while chunk_end > range_start:
+                # IB requires duration strings over 365 days to use year units
+                # instead of day units ("1 Y" not "367 D"). Keep every
+                # day-unit chunk safely under that ceiling.
+                chunk_start = max(range_start, chunk_end - timedelta(days=350))
+                chunks.append((sym, chunk_start, chunk_end))
+                chunk_end = chunk_start - timedelta(days=1)
+            chunks.reverse()  # oldest chunk first, for readable console order
+            queue.extend(chunks)
+        return queue
+ 
+    def nextValidId(self, orderId):
+        self._fire_next_request()
+ 
+    def _fire_next_request(self):
+        if not self.request_queue:
+            print("✅ All historical data requests complete.")
+            self.disconnect()
+            return
+ 
+        sym, chunk_start, chunk_end = self.request_queue.pop(0)
+        contract = Contract()
+        contract.symbol = sym
+        contract.secType = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+ 
+        reqid = self._reqid_counter
+        self._reqid_counter += 1
+        self._reqid_to_symbol[reqid] = sym
+ 
+        end_str = chunk_end.strftime("%Y%m%d") + " 23:59:59 US/Eastern"
+        duration_days = min((chunk_end - chunk_start).days + 2, 365)
+        duration_str = f"{duration_days} D"
+ 
+        print(f"📥 Requesting {sym} bars {chunk_start} -> {chunk_end} ...")
+        self.reqHistoricalData(reqid, contract, end_str, duration_str, "1 day", "TRADES", 1, 1, False, [])
+ 
+    def historicalData(self, reqId, bar):
+        sym = self._reqid_to_symbol.get(reqId)
+        if sym:
+            self.bars[sym].append({"date": bar.date[:8], "close": bar.close})
+ 
+    def historicalDataEnd(self, reqId, start, end):
+        sym = self._reqid_to_symbol.get(reqId, "?")
+        print(f"✅ {sym}: chunk complete ({start} -> {end}).")
+        time.sleep(1.0)  # small pacing cushion between sequential requests
+        self._fire_next_request()
+ 
+    BENIGN_INFO_CODES = {1100, 1101, 1102, 2103, 2104, 2105, 2106, 2107, 2108, 2119, 2137, 2158}
+ 
+    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
+        if errorCode in self.BENIGN_INFO_CODES:
+            return
+        print(f"⚠️ IB ERROR [{reqId}] {errorCode}: {errorString}")
+ 
+ 
+def download_historical_data(symbols, range_start, range_end):
+    downloader = HistoricalDataDownloader(symbols, range_start, range_end)
+    downloader.connect("127.0.0.1", 7497, clientId=8502)
+    downloader.run()
+    return downloader.bars
+ 
+ 
+def load_or_download_bars(symbols):
+    if os.path.exists(DATA_CACHE_PATH):
+        try:
+            with open(DATA_CACHE_PATH, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if all(sym in cached and len(cached[sym]) > 0 for sym in symbols):
+                print("📂 Using cached historical bars (delete the cache file to force a re-download).")
+                return cached
+        except (json.JSONDecodeError, OSError):
+            pass
+ 
+    buffered_start = BACKTEST_START - timedelta(days=VOL_WARMUP_CALENDAR_DAYS)
+    print("🌐 No usable cache found — connecting to TWS/Gateway to download historical bars...")
+    print("   (TWS or IB Gateway must be running and logged in for this step.)")
+    bars = download_historical_data(symbols, buffered_start, BACKTEST_END)
+    with open(DATA_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(bars, f)
+    return bars
+ 
+ 
+# =====================================================================
+# STAGE 2: OFFLINE SIMULATION (no IBKR connection needed from here on)
+# =====================================================================
+def compute_realized_vol_series(closes):
+    """Rolling REALIZED_VOL_WINDOW-day annualized volatility from daily log
+    returns — the proxy standing in for implied volatility, which IBKR
+    does not provide historically for expired option chains."""
+    vols = [None] * len(closes)
+    for i in range(REALIZED_VOL_WINDOW, len(closes)):
+        window = closes[i - REALIZED_VOL_WINDOW:i + 1]
+        rets = [
+            math.log(window[j] / window[j - 1])
+            for j in range(1, len(window))
+            if window[j - 1] > 0 and window[j] > 0
+        ]
+        if len(rets) < 2:
+            continue
+        stdev = statistics.pstdev(rets)
+        vols[i] = stdev * math.sqrt(252)
+    return vols
+ 
+ 
+class PositionState:
+    def __init__(self):
+        self.active = False
+        self.shares = 0
+        self.contracts = 0
+        self.cost_basis_per_share = 0.0
+        self.strike = 0.0
+        self.entry_credit = 0.0
+        self.expiry_day_index = 0          # hard ceiling (real expiration bar index) — safety net only
+        self.dte_backstop_day_index = 0    # the trigger that actually closes almost every position
+ 
+ 
+class Mag7CoveredCallBacktester:
+    def __init__(self, price_data):
+        self.price_data = price_data
+        self.symbol_series = {}
+        self.symbol_vol = {}
+        self.positions = {sym: PositionState() for sym in price_data}
+        self.cash = STARTING_CAPITAL
+        self.trade_log = []
+        self.equity_curve = []
+        self.halted_days = 0
+        self._prepare_series()
+ 
+    def _prepare_series(self):
+        for sym, bars in self.price_data.items():
+            bars_sorted = sorted(bars, key=lambda b: b["date"])
+            closes = [b["close"] for b in bars_sorted]
+            dates = [b["date"] for b in bars_sorted]
+            vols = compute_realized_vol_series(closes)
+            self.symbol_series[sym] = list(zip(dates, closes))
+            self.symbol_vol[sym] = vols
+ 
+    def run(self):
+        start_str = BACKTEST_START.strftime("%Y%m%d")
+        end_str = BACKTEST_END.strftime("%Y%m%d")
+ 
+        master_dates = sorted({
+            d for sym in self.symbol_series for d, _ in self.symbol_series[sym]
+            if start_str <= d <= end_str
+        })
+        idx_lookup = {
+            sym: {d: i for i, (d, _) in enumerate(self.symbol_series[sym])}
+            for sym in self.symbol_series
+        }
+ 
+        if not master_dates:
+            print("⚠️ No trading days found in the requested window — check the cached data.")
+            return
+ 
+        start_of_day_equity = self.cash
+ 
+        for day_str in master_dates:
+            # ---- 0. DAILY RISK BREAKER — checked FIRST, using today's
+            #         marks BEFORE anything else happens that day. This is
+            #         the earliest a daily-bar backtest can detect what the
+            #         live engine's system_halted flag would catch
+            #         intraday. See point 7 in the module docstring: once
+            #         breached, self.system_halted freezes ALL market-data
+            #         processing in the live engine — new entries AND
+            #         managing positions already open — so a halted day
+            #         here does neither. ----
+            equity_before_management = self._mark_to_market(day_str, idx_lookup)
+            halted_today = False
+            if start_of_day_equity > 0:
+                change_pct = (equity_before_management - start_of_day_equity) / start_of_day_equity
+                if change_pct <= -DAILY_DRAWDOWN_HALT_PCT or change_pct >= DAILY_MARKUP_HALT_PCT:
+                    halted_today = True
+                    self.halted_days += 1
+ 
+            if halted_today:
+                self.equity_curve.append((day_str, round(equity_before_management, 2)))
+                start_of_day_equity = equity_before_management
+                continue
+ 
+            # ---- 1. Manage existing positions (DTE backstop, then
+            #         profit-capture, then stop-loss — same precedence as
+            #         the live engine's monitor_exit_targets()) ----
+            for sym, pos in self.positions.items():
+                if not pos.active or day_str not in idx_lookup[sym]:
+                    continue
+                series = self.symbol_series[sym]
+                i = idx_lookup[sym][day_str]
+                _, close = series[i]
+                vol = self.symbol_vol[sym][i] or 0.20
+ 
+                calendar_days_left = max((pos.expiry_day_index - i) / TRADING_DAYS_PER_CALENDAR_DAY, 0.5)
+                theo_price = calculate_black_scholes_value(close, pos.strike, calendar_days_left, RISK_FREE_RATE, vol)
+ 
+                reason = None
+                if i >= pos.dte_backstop_day_index:
+                    reason = "DTE_BACKSTOP"
+                elif theo_price <= pos.entry_credit * TAKE_PROFIT_PCT:
+                    reason = "PROFIT_CAPTURE"
+                elif theo_price >= pos.entry_credit * STOP_LOSS_MULTIPLE:
+                    reason = "STOP_LOSS"
+                elif i >= pos.expiry_day_index:
+                    reason = "EXPIRED"  # safety net; DTE backstop should always fire first
+ 
+                if reason:
+                    self._close_position(sym, day_str, close, theo_price, reason)
+ 
+            # ---- 2. New-position scan — cash-only, even split across
+            #         every symbol that qualifies this pass, same as the
+            #         live engine's evaluate_new_position_opportunities() /
+            #         attempt_new_buy_write(). No EOD flatten anywhere in
+            #         this file — positions simply carry to the next
+            #         trading day. ----
+            eligible = []
+            for sym, pos in self.positions.items():
+                if pos.active or day_str not in idx_lookup[sym]:
+                    continue
+                series = self.symbol_series[sym]
+                i = idx_lookup[sym][day_str]
+                _, close = series[i]
+                vol = self.symbol_vol[sym][i]
+                if vol is None or close <= 0:
+                    continue
+ 
+                solved_strike = solve_strike_for_target_delta(close, TARGET_DTE_DAYS, RISK_FREE_RATE, vol, TARGET_DELTA)
+                strike = solved_strike if solved_strike is not None else close * 1.02
+                theo = calculate_black_scholes_value(close, strike, TARGET_DTE_DAYS, RISK_FREE_RATE, vol)
+                if theo <= 0:
+                    continue
+                annualized_yield = (theo / close) * (365.0 / TARGET_DTE_DAYS)
+                eligible.append((sym, i, close, strike, theo, annualized_yield))
+ 
+            eligible.sort(key=lambda c: c[5], reverse=True)
+ 
+            candidates_remaining = len(eligible)
+            for sym, i, close, strike, theo, ayield in eligible:
+                # Even-split of whatever cash is left THIS PASS across
+                # however many candidates remain to be tried — same logic
+                # as attempt_new_buy_write()'s candidates_remaining
+                # countdown, never margin.
+                if self.cash <= MIN_CASH_BUFFER:
+                    candidates_remaining -= 1
+                    continue
+                allocation = min(self.cash / max(candidates_remaining, 1), self.cash)
+                shares_affordable = int(allocation // (close * 100)) * 100
+                candidates_remaining -= 1
+                if shares_affordable < 100:
+                    continue
+ 
+                contracts = shares_affordable // 100
+                cost = shares_affordable * close
+                credit = theo * 100 * contracts
+ 
+                pos = self.positions[sym]
+                trading_day_offset_to_expiry = max(int(TARGET_DTE_DAYS * TRADING_DAYS_PER_CALENDAR_DAY), 1)
+                dte_backstop_offset = max(int(trading_day_offset_to_expiry * (1.0 - DTE_BACKSTOP_PCT)), 1)
+                series = self.symbol_series[sym]
+ 
+                pos.active = True
+                pos.shares = shares_affordable
+                pos.contracts = contracts
+                pos.cost_basis_per_share = close
+                pos.strike = strike
+                pos.entry_credit = theo
+                pos.expiry_day_index = min(i + trading_day_offset_to_expiry, len(series) - 1)
+                pos.dte_backstop_day_index = min(i + dte_backstop_offset, len(series) - 1)
+ 
+                self.cash -= cost
+                self.cash += credit
+                self._log_trade(sym, day_str, "OPEN_BUY_WRITE", contracts, strike, theo, credit - cost)
+ 
+            final_equity = self._mark_to_market(day_str, idx_lookup)
+            self.equity_curve.append((day_str, round(final_equity, 2)))
+            start_of_day_equity = final_equity
+ 
+        self._write_outputs()
+        self._print_summary()
+ 
+    def _mark_to_market(self, day_str, idx_lookup):
+        total = self.cash
+        for sym, pos in self.positions.items():
+            if pos.shares > 0 and day_str in idx_lookup[sym]:
+                i = idx_lookup[sym][day_str]
+                _, close = self.symbol_series[sym][i]
+                total += pos.shares * close
+        return total
+ 
+    def _close_position(self, sym, day_str, close_price, buyback_price, reason):
+        """RECYCLE, not roll: sells the shares AND buys back the call, same
+        as the live engine's recycle_symbol_after_close(). Both legs'
+        cash flows are applied and both are combined into the logged P&L —
+        this is a full round-trip exit, not just an option buy-to-close."""
+        pos = self.positions[sym]
+ 
+        option_buyback_cost = buyback_price * 100 * pos.contracts
+        stock_sale_proceeds = close_price * pos.shares
+ 
+        self.cash -= option_buyback_cost
+        self.cash += stock_sale_proceeds
+ 
+        stock_pnl = (close_price - pos.cost_basis_per_share) * pos.shares
+        option_pnl = (pos.entry_credit - buyback_price) * 100 * pos.contracts
+        total_pnl = stock_pnl + option_pnl
+ 
+        self._log_trade(sym, day_str, reason, pos.contracts, pos.strike, buyback_price, total_pnl)
+ 
+        pos.active = False
+        pos.shares = 0
+        pos.contracts = 0
+ 
+    def _log_trade(self, sym, day_str, event, contracts, strike, credit_or_debit, pnl):
+        self.trade_log.append({
+            "date": day_str, "symbol": sym, "event": event, "contracts": contracts,
+            "strike": round(strike, 2), "credit_or_debit": round(credit_or_debit, 4), "pnl": round(pnl, 2),
+        })
+ 
+    def _write_outputs(self):
+        with open(TRADE_LOG_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["date", "symbol", "event", "contracts", "strike", "credit_or_debit", "pnl"])
+            writer.writeheader()
+            writer.writerows(self.trade_log)
+        with open(EQUITY_CURVE_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["date", "equity"])
+            writer.writerows(self.equity_curve)
+ 
+    def _print_summary(self):
+        if not self.equity_curve:
+            print("⚠️ No equity curve generated — check that historical data actually loaded.")
+            return
+ 
+        final_equity = self.equity_curve[-1][1]
+        total_return_pct = (final_equity - STARTING_CAPITAL) / STARTING_CAPITAL * 100
+        years = (BACKTEST_END - BACKTEST_START).days / 365.25
+        cagr = ((final_equity / STARTING_CAPITAL) ** (1 / years) - 1) * 100 if years > 0 and final_equity > 0 else 0.0
+ 
+        peak = STARTING_CAPITAL
+        max_dd = 0.0
+        for _, eq in self.equity_curve:
+            peak = max(peak, eq)
+            if peak > 0:
+                max_dd = max(max_dd, (peak - eq) / peak)
+ 
+        close_events = ("PROFIT_CAPTURE", "STOP_LOSS", "DTE_BACKSTOP", "EXPIRED")
+        closes = [t for t in self.trade_log if t["event"] in close_events]
+        wins = sum(1 for t in closes if t["pnl"] > 0)
+        win_rate = (wins / len(closes) * 100) if closes else 0.0
+ 
+        by_reason = {}
+        for t in closes:
+            by_reason.setdefault(t["event"], []).append(t["pnl"])
+ 
+        print("\n================= MAG 7 BACKTEST SUMMARY =================")
+        print(f"Period: {BACKTEST_START} -> {BACKTEST_END}  (model-priced options, not real quotes)")
+        print(f"Universe: {CANDIDATE_UNIVERSE['mag7']}")
+        print(f"Starting Capital: ${STARTING_CAPITAL:,.2f}")
+        print(f"Final Equity:     ${final_equity:,.2f}")
+        print(f"Total Return:     {total_return_pct:+.1f}%")
+        print(f"CAGR:             {cagr:+.1f}%")
+        print(f"Max Drawdown:     {max_dd*100:.1f}%")
+        print(f"Positions Closed: {len(closes)} | Win Rate: {win_rate:.1f}%")
+        for reason, pnls in sorted(by_reason.items()):
+            print(f"   {reason}: {len(pnls)} closes, total P&L ${sum(pnls):,.2f}")
+        print(f"Daily risk-breaker halts hit: {self.halted_days} day(s) (see point 7 in the module docstring)")
+        print(f"Trade log    -> {TRADE_LOG_CSV_PATH}")
+        print(f"Equity curve -> {EQUITY_CURVE_CSV_PATH}")
+        print("============================================================")
+ 
+ 
+def main():
+    symbols = sorted({s for cat in CANDIDATE_UNIVERSE.values() for s in cat})
+    bars = load_or_download_bars(symbols)
+    backtester = Mag7CoveredCallBacktester(bars)
+    backtester.run()
+ 
+ 
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n🛑 Backtest manually aborted.")
+        sys.exit()
