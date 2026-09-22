@@ -1,0 +1,43 @@
+import asyncio
+
+# Fix for Python 3.14: initialize an event loop before loading ib_async
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
+import random
+from ib_async import *
+
+# 1. Create the Interactive Brokers controller
+ib = IB()
+
+# 2. Pick a random Client ID
+safe_client_id = random.randint(1, 9999)
+
+try:
+    print(f"🔄 Trying to connect using Client ID: {safe_client_id}...")
+    
+    # 3. Connect to your computer (127.0.0.1) on the standard paper trading port (7497)
+    ib.connect('127.0.0.1', 7497, clientId=safe_client_id)
+    
+    print("\n🎉 SUCCESS! VS Code has successfully connected to the TWS API!")
+    print("==================================================================")
+    print(f"📡 Connected to TWS Server Version: {ib.client.serverVersion()}")
+    print(f"💳 Your Paper Trading Account ID is: {ib.wrapper.accounts}")
+    print("==================================================================")
+
+except Exception as e:
+    print("\n❌ CONNECTION FAILED!")
+    print("==================================================================")
+    print(f"Error Details: {e}")
+    print("==================================================================")
+    print("Please check your TWS application settings:")
+    print("1. Make sure TWS is open and logged into your Paper Trading account.")
+    print("2. Go to File > Global Configuration > API > Settings.")
+    print("3. Ensure 'Enable ActiveX and Socket Clients' is CHECKED.")
+    print("4. Verify the 'Socket port' in TWS is exactly 7497.")
+
+finally:
+    # 4. Clean up connection
+    if ib.isConnected():
+        ib.disconnect()
+        print("\n🔌 Disconnected cleanly from TWS API.")
