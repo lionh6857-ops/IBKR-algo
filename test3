@@ -1,0 +1,266 @@
+import sys
+import math
+import datetime
+import threading
+from ibapi.client import EClient
+from ibapi.wrapper import EWrapper
+from ibapi.contract import Contract
+from ibapi.order import Order
+
+# 🧮 STEP 2: PURE PYTHON BLACK-SCHOLES MATH
+def pure_python_norm_cdf(x):
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+def calculate_black_scholes_value(stock_price, strike, days_to_expiry, risk_free_rate, volatility):
+    if stock_price <= 0 or strike <= 0 or days_to_expiry <= 0 or volatility <= 0:
+        return 0.0
+    T = days_to_expiry / 365.0
+    d1 = (math.log(stock_price / strike) + (risk_free_rate + 0.5 * volatility ** 2) * T) / (volatility * math.sqrt(T))
+    d2 = d1 - volatility * math.sqrt(T)
+    call_price = stock_price * pure_python_norm_cdf(d1) - strike * math.exp(-risk_free_rate * T) * pure_python_norm_cdf(d2)
+    return round(call_price, 2)
+
+
+class RiskProtectedEngine(EWrapper, EClient):
+    def __init__(self):
+        EClient.__init__(self, self)
+        self.next_order_id = None
+        self.live_stock_price = 0.0
+        self.live_option_ask = 0.0
+        self.live_option_bid = 0.0
+        self.contract_resolved = False
+        self.has_executed = False  
+        self.heartbeat_count = 0
+        
+        # 🛡️ POSITION STATUS INDICATORS
+        self.position_active = False
+        self.entry_price = 0.0
+        self.take_profit_target = 0.0
+        self.stop_loss_target = 0.0
+        
+        # 📈 PERFORMANCE TRACKING STATS
+        self.starting_balance = 250000.0
+        self.closing_balance = 250000.0
+        self.total_trades = 0
+        self.wins = 0
+        
+        # 🚨 RISK PARAMETER BOUNDARIES
+        self.max_daily_drawdown_pct = 0.02  # 2% Max Loss Limit ($2,000 max risk)
+        self.max_daily_markup_pct = 0.03    # 3% Max Profit Cap ($3,000 max target)
+        self.system_halted = False          # Global circuit breaker latch
+
+    def nextValidId(self, orderId: int):
+        self.next_order_id = orderId
+        print(f"🎉 RISK-PROTECTED ENGINE ONLINE. ACTIVE ID: {self.next_order_id}")
+        self.reqMarketDataType(3)  
+        self.write_to_notepad("SYSTEM UPDATE: Trading Engine launched with Maximum Drawdown & Markup circuit breakers active.")
+        
+        # --- STEP 1: INITIAL DATA STREAM FOR UNDERLYING STOCK ---
+        spy_stock = Contract()
+        spy_stock.symbol = "SPY"
+        spy_stock.secType = "STK"
+        spy_stock.exchange = "SMART"
+        spy_stock.currency = "USD"
+        spy_stock.primaryExchange = "ARCA" # <-- ADD THIS LINE HERE!
+        
+        print("📡 Booting Eye 1: Streaming underlying stock prices...")
+        self.reqMktData(reqId=1, contract=spy_stock, genericTickList="", snapshot=False, regulatorySnapshot=False, mktDataOptions=[])
+        
+        self.check_market_clock()
+
+    def check_market_clock(self):
+        now = datetime.datetime.now()
+        
+        # 🚨 THE 3:50 PM FORCE-EXIT PANIC SWITCH
+        if now.hour == 15 and now.minute >= 50 and self.position_active:
+            self.write_to_notepad("⚠️ EOD FLAT RULE TRIGGERED: Forcing instant market exit before close...")
+            print("\n⚠️ EOD FLAT RULE TRIGGERED: Clearing book to zero cash...")
+            self.trigger_sell_order_payload()
+        
+        # 🛑 THE 4:00 PM CLOSING BELL SHUTDOWN
+        if now.hour >= 16:
+            self.shutdown_engine()
+            return
+            
+        self.heartbeat_count += 1
+        if self.heartbeat_count >= 60:
+            self.heartbeat_count = 0
+            status_text = "Halted" if self.system_halted else ("Position Open" if self.position_active else "Scanning Market")
+            print(f"💓 [HEARTBEAT {now.strftime('%I:%M %p')}] Engine online. Mode: {status_text}...")
+
+        threading.Timer(1.0, self.check_market_clock).start()
+    def tickPrice(self, reqId: int, tickType: int, price: float, attrib):
+        # If the system circuit breaker is tripped, reject all incoming prices immediately!
+        if price <= 0 or self.system_halted:
+            return
+
+        # DATA ROUTER LAYER
+        if reqId == 1 and tickType == 68: 
+            self.live_stock_price = price
+            if not self.contract_resolved:
+                self.contract_resolved = True
+                self.resolve_dynamic_option_contract()
+                
+        elif reqId == 2:
+            if tickType == 67: 
+                self.live_option_ask = price
+            elif tickType == 66: 
+                self.live_option_bid = price
+
+        # EVALUATION ROUTER
+        if not self.has_executed and self.live_stock_price > 0 and self.live_option_ask > 0:
+            self.evaluate_and_execute()
+        elif self.position_active and self.live_option_bid > 0:
+            self.monitor_exit_targets()
+
+    def resolve_dynamic_option_contract(self):
+        dynamic_strike = round(self.live_stock_price / 5.0) * 5.0
+        search_option = Contract()
+        search_option.symbol = "SPY"
+        search_option.secType = "OPT"
+        search_option.exchange = "SMART"
+        search_option.currency = "USD"
+        search_option.lastTradeDateOrContractMonth = "202609" 
+        search_option.strike = float(dynamic_strike)
+        search_option.right = "C"
+        
+        print(f"🔍 Dynamic Search Initiated: Querying database for ${dynamic_strike} Call options...")
+        self.reqContractDetails(reqId=10, contract=search_option)
+
+    def contractDetails(self, reqId: int, contractDetails):
+        if reqId == 10:
+            self.target_option = contractDetails.contract
+            msg = f"CONTRACT ATTACHED: Eye 2 locked onto {self.target_option.localSymbol}"
+            print(f"✅ {msg}")
+            self.write_to_notepad(msg)
+            self.reqMktData(reqId=2, contract=self.target_option, genericTickList="", snapshot=False, regulatorySnapshot=False, mktDataOptions=[])
+
+    def evaluate_and_execute(self):
+        days_left = 8.0
+        interest_rate = 0.05
+        dynamic_vol = 0.22 
+        
+        theoretical_value = calculate_black_scholes_value(
+            self.live_stock_price, self.target_option.strike, 
+            days_left, interest_rate, dynamic_vol
+        )
+        
+        if self.live_option_ask < theoretical_value:
+            self.has_executed = True
+            alert = f"💥 SIGNAL MATCH FOUND! SPY Stock: ${self.live_stock_price} | Option Ask: ${self.live_option_ask} | Calculated Fair Value: ${theoretical_value}"
+            print(f"\n{alert}")
+            self.write_to_notepad(alert)
+            self.trigger_buy_order_payload()
+
+    def trigger_buy_order_payload(self):
+        self.write_to_notepad("ORDER ROUTING: Submitting automated limit buy transaction...")
+        buy_order = Order()
+        buy_order.action = "BUY"
+        buy_order.orderType = "LMT"
+        buy_order.totalQuantity = 1
+        buy_order.lmtPrice = self.live_option_ask
+        buy_order.transmit = True
+        self.placeOrder(self.next_order_id, self.target_option, buy_order)
+
+    def orderStatus(self, orderId: int, status: str, filled: float, remaining: float, avgFillPrice: float, permId: int, parentId: int, lastFillPrice: float, clientId: int, whyHeld: str, mktCapPrice: float):
+        if status == "Filled" and not self.position_active and orderId == self.next_order_id:
+            self.position_active = True
+            self.entry_price = avgFillPrice
+            self.take_profit_target = round(self.entry_price * 1.20, 2)
+            self.stop_loss_target = round(self.entry_price * 0.90, 2)
+            self.total_trades += 1
+            
+            fill_msg = f"📦 POSITION OPENED! Fill Price: ${self.entry_price} | TP Target: ${self.take_profit_target} | SL Target: ${self.stop_loss_target}"
+            print(f"\n{fill_msg}")
+            self.write_to_notepad(fill_msg)
+
+    def monitor_exit_targets(self):
+        # Target Check 1: Single Trade Take Profit Hit
+        if self.live_option_bid >= self.take_profit_target:
+            self.position_active = False
+            msg = f"💰 TAKE PROFIT TRIGGERED! Market Bid is ${self.live_option_bid} >= Target ${self.take_profit_target}"
+            print(f"\n{msg}")
+            self.write_to_notepad(msg)
+            self.wins += 1
+            
+            trade_gain = round((self.live_option_bid - self.entry_price) * 100.0, 2)
+            self.closing_balance += trade_gain
+            self.trigger_sell_order_payload()
+            self.check_global_account_risk() 
+            
+        # Target Check 2: Single Trade Stop Loss Hit
+        elif self.live_option_bid <= self.stop_loss_target:
+            self.position_active = False
+            msg = f"⚠️ STOP LOSS TRIGGERED! Market Bid is ${self.live_option_bid} <= Target ${self.stop_loss_target}"
+            print(f"\n{msg}")
+            self.write_to_notepad(msg)
+            
+            trade_loss = round((self.entry_price - self.live_option_bid) * 100.0, 2)
+            self.closing_balance -= trade_loss
+            self.trigger_sell_order_payload()
+            self.check_global_account_risk() 
+
+    # 🛑 THE GLOBAL ACCOUNT RISK CIRCUIT BREAKER
+    def check_global_account_risk(self):
+        current_net_change_pct = (self.closing_balance - self.starting_balance) / self.starting_balance
+        
+        if current_net_change_pct <= -self.max_daily_drawdown_pct:
+            self.system_halted = True
+            halt_msg = f"🚨 RISK EMERGENCY: MAXIMUM DRAWDOWN BREACHED ({current_net_change_pct*100:.1f}%). TRADING HALTED TO PRESERVE CAPITAL."
+            print(f"\n{halt_msg}")
+            self.write_to_notepad(halt_msg)
+            
+        elif current_net_change_pct >= self.max_daily_markup_pct:
+            self.system_halted = True
+            halt_msg = f"📈 TARGET ACHIEVED: MAXIMUM DAILY MARKUP REACHED (+{current_net_change_pct*100:.1f}%). LOCKING IN PROFIT AND CLOSING SESSION."
+            print(f"\n{halt_msg}")
+            self.write_to_notepad(halt_msg)
+
+    def trigger_sell_order_payload(self):
+        self.next_order_id += 1
+        self.write_to_notepad("ORDER ROUTING: Transmitting market exit payload...")
+        sell_order = Order()
+        sell_order.action = "SELL"
+        sell_order.orderType = "MKT"
+        sell_order.totalQuantity = 1
+        sell_order.transmit = True
+        self.placeOrder(self.next_order_id, self.target_option, sell_order)
+        print("🏁 Exit transaction complete. Position closed cleanly.")
+
+    def write_to_notepad(self, text_to_log):
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted_line = f"[{timestamp}] {text_to_log}\n"
+        with open(r"C:\Users\Brandon.R\trade_log.txt", "a", encoding="utf-8") as file:
+            file.write(formatted_line)
+
+    def shutdown_engine(self):
+        win_rate = (self.wins / self.total_trades * 100.0) if self.total_trades > 0 else 0.0
+        net_pl = round(self.closing_balance - self.starting_balance, 2)
+        pl_prefix = "+" if net_pl >= 0 else ""
+        
+        summary_block = (
+            "\n==================================================\n"
+            "🗒️ --- FINAL END-OF-DAY PERFORMANCE SUMMARY ---\n"
+            f"📅 Session Date: {datetime.datetime.now().strftime('%Y-%m-%d')}\n"
+            f"📦 Total Trades Executed Today: {self.total_trades}\n"
+            f"💰 Starting Balance: ${self.starting_balance:,.2f}\n"
+            f"📈 Closing Balance: ${self.closing_balance:,.2f}\n"
+            f"🟢 Net Profit/Loss: {pl_prefix}${net_pl:,.2f}\n"
+            f"🌟 Total Session Win Rate: {win_rate}%\n"
+            "=================================================="
+        )
+        print(summary_block)
+        self.write_to_notepad(summary_block)
+        self.cancelMktData(1)
+        if hasattr(self, 'target_option'):
+            self.cancelMktData(2)
+        self.disconnect()
+
+# Launch risk-protected system
+try:
+    engine = RiskProtectedEngine()
+    engine.connect("127.0.0.1", 7497, clientId=8157)
+    engine.run()
+except KeyboardInterrupt:
+    print("\n🛑 Session manually aborted.")
+    sys.exit()
