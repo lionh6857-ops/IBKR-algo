@@ -1,0 +1,67 @@
+import sys
+import threading
+from ibapi.client import EClient
+from ibapi.wrapper import EWrapper
+from ibapi.contract import Contract
+
+class PatientOptionStreamer(EWrapper, EClient):
+    def __init__(self):
+        EClient.__init__(self, self)
+        self.data_requested = False
+
+    def nextValidId(self, orderId: int):
+        print("🎉 SUCCESS: Connected to IBKR Paper Trading Account!")
+        print("🔓 Switching data settings to: FREE DELAYED DATA...")
+        self.reqMarketDataType(3) 
+        
+        # 1. Create a focused Option template to search for
+        search_contract = Contract()
+        search_contract.symbol = "SPY"
+        search_contract.secType = "OPT"
+        search_contract.exchange = "SMART"
+        search_contract.currency = "USD"
+        search_contract.lastTradeDateOrContractMonth = "202609" # September 2026
+        search_contract.right = "C"                             # Call options
+        
+        print("🔍 Scanning IBKR servers for September SPY Call Options... (This may take a minute)")
+        self.reqContractDetails(reqId=1, contract=search_contract)
+        
+        # ⏱️ EXTENDED TIME: Increased from 20 seconds to 90 seconds!
+        print("⏰ Safety timer activated: This script will auto-close in 90 seconds...")
+        threading.Timer(90.0, self.stop_bot).start()
+
+    # 2. This triggers when IBKR sends back the contracts
+    def contractDetails(self, reqId: int, contractDetails):
+        if not self.data_requested:
+            self.data_requested = True
+            valid_option = contractDetails.contract
+            
+            print(f"\n✅ Found Verified Contract: {valid_option.localSymbol} (ID: {valid_option.conId})")
+            print("🚀 Step 1 Initiated: Requesting free data stream for this contract...")
+            
+            # Start streaming the data pipeline
+            self.reqMktData(reqId=2, contract=valid_option, genericTickList="", snapshot=False, regulatorySnapshot=False, mktDataOptions=[])
+            print("📡 Listening for option ticks... (Press Ctrl+C to exit early)")
+
+    def tickPrice(self, reqId: int, tickType: int, price: float, attrib):
+        if tickType == 66:
+            print(f"🟢 [OPTION DELAYED BID] Buyer Price: ${price}")
+        elif tickType == 67:
+            print(f"🔴 [OPTION DELAYED ASK] Seller Price: ${price}")
+        elif tickType == 68:
+            print(f"⚡ [OPTION DELAYED LAST] Last Trade: ${price}")
+
+    def stop_bot(self):
+        print("\n🛑 90 seconds is up! Stopping data streams and disconnecting...")
+        self.cancelMktData(2) 
+        self.disconnect()
+        print("🏁 Disconnected cleanly. The loop has ended!")
+
+# Launch the patient streamer
+try:
+    stream = PatientOptionStreamer()
+    stream.connect("127.0.0.1", 7497, clientId=8157)
+    stream.run()
+except KeyboardInterrupt:
+    print("\n🛑 Stream stopped cleanly.")
+    sys.exit()
