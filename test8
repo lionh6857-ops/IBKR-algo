@@ -1,0 +1,619 @@
+import sys
+import os
+import json
+import math
+import datetime
+import threading
+from ibapi.client import EClient
+from ibapi.wrapper import EWrapper
+from ibapi.contract import Contract
+from ibapi.order import Order
+
+# 🧮 PURE PYTHON BLACK-SCHOLES MATH
+def pure_python_norm_cdf(x):
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+def calculate_black_scholes_value(stock_price, strike, days_to_expiry, risk_free_rate, volatility):
+    if stock_price <= 0 or strike <= 0 or days_to_expiry <= 0 or volatility <= 0:
+        return 0.0
+    T = days_to_expiry / 365.0
+    d1 = (math.log(stock_price / strike) + (risk_free_rate + 0.5 * volatility ** 2) * T) / (volatility * math.sqrt(T))
+    d2 = d1 - volatility * math.sqrt(T)
+    call_price = stock_price * pure_python_norm_cdf(d1) - strike * math.exp(-risk_free_rate * T) * pure_python_norm_cdf(d2)
+    return round(call_price, 2)
+
+
+# 🕒 DELAYED-DATA-AWARE TICK TYPE GROUPS
+BID_TICKS = {1, 66}          # BID, DELAYED_BID
+ASK_TICKS = {2, 67}          # ASK, DELAYED_ASK
+LAST_TICKS = {4, 68}         # LAST, DELAYED_LAST
+CLOSE_TICKS = {9, 75}        # CLOSE, DELAYED_CLOSE (fallback when no live/last tick streams)
+
+# 📁 LOCAL STATE FILES (adjust paths as needed)
+TRADE_LOG_PATH = r"C:\Users\Brandon.R\trade_log.txt"
+SESSION_HISTORY_PATH = r"C:\Users\Brandon.R\engine_session_history.json"
+
+# How often (in heartbeat ticks, ~1/sec) to re-check actual broker positions
+# against what the engine thinks it holds. This is what catches early
+# assignment/exercise — the engine doesn't wait for its own exit logic to
+# discover a position is already gone.
+RECONCILIATION_INTERVAL_HEARTBEATS = 60  # ~once a minute
+
+
+class CoveredCallEngine(EWrapper, EClient):
+    """
+    LEVEL 1 OPTIONS STRATEGY: COVERED CALL.
+
+    Sells (writes) a SPY call against SPY shares already held in the
+    account, confirmed via reqPositions() before ever writing anything.
+
+    v2 additions:
+    - On startup, also checks for an EXISTING open short SPY call position
+      (not just shares) and adopts it as the position to manage, instead of
+      blindly assuming no position is open just because the script restarted.
+    - Periodically re-polls broker positions while running and compares them
+      to what the engine expects, to catch early assignment/exercise or any
+      other out-of-band change to the position.
+    """
+
+    def __init__(self):
+        EClient.__init__(self, self)
+        self.next_order_id = None
+        self.live_stock_price = 0.0
+        self.live_option_ask = 0.0
+        self.live_option_bid = 0.0
+        self.contract_resolved = False
+        self.chain_contracts = []   # accumulated SPY option chain from reqContractDetails
+        self.has_executed = False
+
+        self.heartbeat_count = 0
+
+        # 🛡️ POSITION STATUS INDICATORS (short call = the position we've written)
+        self.position_active = False
+        self.entry_credit = 0.0        # premium per share received when we sold the call
+        self.take_profit_target = 0.0  # buy back when option price DROPS to this
+        self.stop_loss_target = 0.0    # buy back when option price RISES to this
+        self.position_quantity = 0
+        self.target_option = None
+
+        # 📦 SHARE POSITION (the actual "cover" for the covered call)
+        self.spy_shares_owned = 0
+        self.shares_position_ready = False  # gate: don't evaluate until we've confirmed real holdings
+        self.last_known_shares = None
+
+        # 📋 POSITION SNAPSHOT ACCUMULATOR (refilled on every reqPositions() call,
+        # both the initial startup check and every reconciliation pass)
+        self._latest_short_calls = []   # list of (contract, position_qty, avg_cost)
+        self._initial_snapshot_done = False
+
+        # 🎯 STRATEGY TUNING
+        self.risk_per_trade_pct = 0.01     # 1% of capital at risk per trade
+        self.take_profit_pct = 0.50        # close once option value decays to 50% of credit received
+        self.stop_loss_multiple = 2.0      # close if option value rises to 2x credit received (adverse rally)
+        self.call_otm_offset = 10.0        # write calls this many $ above the at-the-money strike
+
+        # 📈 PERFORMANCE TRACKING STATS
+        self.starting_balance = 0.0
+        self.closing_balance = 0.0
+        self.account_balance_ready = False   # gate: don't trade until we know real cash capital
+        self.total_trades = 0
+        self.wins = 0
+        self.session_history = self.load_session_history()
+
+        # 🚨 RISK PARAMETER BOUNDARIES
+        self.max_daily_drawdown_pct = 0.02
+        self.max_daily_markup_pct = 0.03
+        self.system_halted = False
+
+        # 🧾 ORDER INTENT TRACKING
+        self.order_intents = {}  # order_id -> "OPEN" or "CLOSE"
+
+    # ---------------------------------------------------------------
+    # SESSION HISTORY PERSISTENCE
+    # ---------------------------------------------------------------
+    def load_session_history(self):
+        if not os.path.exists(SESSION_HISTORY_PATH):
+            return []
+        try:
+            with open(SESSION_HISTORY_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    def save_session_history(self):
+        try:
+            with open(SESSION_HISTORY_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.session_history, f, indent=2)
+        except OSError as e:
+            print(f"⚠️ Could not write session history: {e}")
+
+    def append_todays_session(self):
+        entry = {
+            "date": datetime.datetime.now().strftime("%Y-%m-%d"),
+            "starting_cash": self.starting_balance,
+            "closing_cash": self.closing_balance,
+            "trades": self.total_trades,
+            "wins": self.wins,
+            "net_pl": round(self.closing_balance - self.starting_balance, 2),
+        }
+        self.session_history.append(entry)
+        self.save_session_history()
+
+    # ---------------------------------------------------------------
+    # IB CALLBACKS
+    # ---------------------------------------------------------------
+    def nextValidId(self, orderId: int):
+        self.next_order_id = orderId
+        print(f"🎉 COVERED-CALL ENGINE ONLINE. ACTIVE ID: {self.next_order_id}")
+        self.reqMarketDataType(3)  # 3 = Delayed data
+        self.write_to_notepad("SYSTEM UPDATE: Covered-call engine launched (Level 1 strategy).")
+
+        print("💳 Requesting current account cash balance...")
+        self.reqAccountSummary(9001, "All", "TotalCashValue")
+
+        print("📦 Requesting current portfolio positions (shares AND any existing short calls)...")
+        self.request_position_snapshot()
+
+        chain_search = Contract()
+        chain_search.symbol = "SPY"
+        chain_search.secType = "OPT"
+        chain_search.exchange = "SMART"
+        chain_search.currency = "USD"
+        chain_search.lastTradeDateOrContractMonth = "202609"
+        chain_search.right = "C"
+        # strike intentionally left unset -> returns every available strike
+
+        print("🔍 Pulling full SPY Sept-2026 call chain (contract lookup, no market data needed)...")
+        self.reqContractDetails(reqId=10, contract=chain_search)
+
+        self.check_market_clock()
+
+    BENIGN_INFO_CODES = {1100, 1101, 1102, 2103, 2104, 2105, 2106, 2107, 2108, 2119, 2137, 2158}
+
+    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
+        if errorCode in self.BENIGN_INFO_CODES:
+            print(f"ℹ️ [{errorCode}] {errorString}")
+            return
+        msg = f"⚠️ IB ERROR [reqId={reqId}] Code {errorCode}: {errorString}"
+        print(msg)
+        self.write_to_notepad(msg)
+
+    def marketDataType(self, reqId: int, marketDataType: int):
+        mode_labels = {1: "LIVE", 2: "FROZEN", 3: "DELAYED", 4: "DELAYED FROZEN"}
+        label = mode_labels.get(marketDataType, f"UNKNOWN({marketDataType})")
+        msg = f"📶 Market data mode confirmed for reqId {reqId}: {label}"
+        print(msg)
+        self.write_to_notepad(msg)
+
+    def accountSummary(self, reqId, account, tag, value, currency):
+        if tag != "TotalCashValue":
+            return
+        print(f"🧾 accountSummary received: tag={tag} currency={currency} value={value}")
+        if currency == "BASE" or not self.account_balance_ready:
+            self.starting_balance = float(value)
+            self.closing_balance = self.starting_balance
+            self.account_balance_ready = True
+            msg = f"💰 LIVE ACCOUNT CASH LOADED: ${self.starting_balance:,.2f} (account {account}, currency={currency})."
+            print(msg)
+            self.write_to_notepad(msg)
+
+    def accountSummaryEnd(self, reqId):
+        if not self.account_balance_ready:
+            warn = (
+                "⚠️ accountSummaryEnd fired but no TotalCashValue was ever received. "
+                "Check TWS API settings, other bound clients, and that the paper account is logged in."
+            )
+            print(warn)
+            self.write_to_notepad(warn)
+        self.cancelAccountSummary(reqId)
+
+    # ---------------------------------------------------------------
+    # POSITION CALLBACKS — now handles BOTH shares (the cover) AND any
+    # existing short call (the thing that might already be open, or might
+    # get partially/fully assigned while this engine is running).
+    # ---------------------------------------------------------------
+    def request_position_snapshot(self):
+        """Wraps reqPositions() so the accumulator is always cleared right
+        before each snapshot request — used both at startup and on every
+        periodic reconciliation pass."""
+        self._latest_short_calls = []
+        self.reqPositions()
+
+    def position(self, account, contract, position: float, avgCost: float):
+        if contract.symbol == "SPY" and contract.secType == "STK":
+            self.spy_shares_owned = int(position)
+        elif contract.symbol == "SPY" and contract.secType == "OPT" and contract.right == "C" and position < 0:
+            # A short call — could be a fresh find at startup, or the same
+            # position confirmed still open during a reconciliation pass.
+            self._latest_short_calls.append((contract, int(position), avgCost))
+
+    def positionEnd(self):
+        self.shares_position_ready = True
+        max_contracts = self.spy_shares_owned // 100
+
+        if not self._initial_snapshot_done:
+            self._initial_snapshot_done = True
+            self.last_known_shares = self.spy_shares_owned
+
+            msg = (
+                f"📦 SHARE POSITION CONFIRMED: {self.spy_shares_owned} shares of SPY held "
+                f"-> can cover up to {max_contracts} call contract(s)."
+            )
+            print(msg)
+            self.write_to_notepad(msg)
+            if self.spy_shares_owned < 100:
+                warn = "⚠️ Fewer than 100 SPY shares held — engine will NOT write any calls until shares are added."
+                print(warn)
+                self.write_to_notepad(warn)
+
+            if self._latest_short_calls:
+                if len(self._latest_short_calls) > 1:
+                    warn = "⚠️ Multiple existing SPY short call positions found. This engine only manages one at a time — adopting the first, leaving the rest untouched."
+                    print(warn)
+                    self.write_to_notepad(warn)
+
+                contract, qty, avg_cost = self._latest_short_calls[0]
+                self.target_option = contract
+                self.position_active = True
+                self.position_quantity = abs(qty)
+                # NOTE: IBKR's avgCost for option positions can be reported
+                # either per-share or already multiplied by the 100-share
+                # contract multiplier depending on account/report settings.
+                # Printed raw so you can verify it against what you actually
+                # sold this call for before trusting the TP/SL math below.
+                print(f"🧾 RAW avgCost from broker for existing short call: {avg_cost} — verify this against your actual sale price per share.")
+                self.entry_credit = avg_cost
+                self.take_profit_target = round(self.entry_credit * self.take_profit_pct, 2)
+                self.stop_loss_target = round(self.entry_credit * self.stop_loss_multiple, 2)
+                self.has_executed = True   # manage this position; don't search for a new one
+                self.contract_resolved = True
+                msg = (
+                    f"🔁 RESUMING EXISTING POSITION: {self.target_option.localSymbol} short "
+                    f"{self.position_quantity} contract(s) adopted from the account. "
+                    f"Buy-back TP=${self.take_profit_target} SL=${self.stop_loss_target}"
+                )
+                print(msg)
+                self.write_to_notepad(msg)
+                self.reqMktData(reqId=2, contract=self.target_option, genericTickList="", snapshot=False, regulatorySnapshot=False, mktDataOptions=[])
+        else:
+            # RECONCILIATION PASS — compare what we expect vs what the broker
+            # actually shows, right now, while the engine is running.
+            if self.spy_shares_owned != self.last_known_shares:
+                note = f"📦 Share count changed since last check: {self.last_known_shares} -> {self.spy_shares_owned}"
+                print(note)
+                self.write_to_notepad(note)
+                self.last_known_shares = self.spy_shares_owned
+
+            if self.position_active and self.target_option is not None:
+                match_qty = next((qty for (c, qty, ac) in self._latest_short_calls if c.conId == self.target_option.conId), None)
+                actual_qty = abs(match_qty) if match_qty is not None else 0
+
+                if actual_qty < self.position_quantity:
+                    delta = self.position_quantity - actual_qty
+                    warn = (
+                        f"🚨 POSITION MISMATCH: expected {self.position_quantity} short contract(s) on "
+                        f"{self.target_option.localSymbol}, broker now shows {actual_qty}. This most likely "
+                        f"means {delta} contract(s) were ASSIGNED (early exercise) or closed outside this "
+                        f"script. This engine's own P&L tracking does NOT account for assignment cash/share "
+                        f"flows — check IBKR's Activity Statement for the real impact. "
+                        f"Halting further automatic writing for the remainder of today as a precaution."
+                    )
+                    print(warn)
+                    self.write_to_notepad(warn)
+                    self.position_quantity = actual_qty
+                    if actual_qty == 0:
+                        self.position_active = False
+                    self.system_halted = True
+
+        self.cancelPositions()
+
+    def check_market_clock(self):
+        now = datetime.datetime.now()
+
+        if now.hour == 15 and now.minute >= 50 and self.position_active:
+            self.position_active = False
+            self.write_to_notepad("⚠️ EOD FLAT RULE TRIGGERED: Buying back short call before close...")
+            print("\n⚠️ EOD FLAT RULE TRIGGERED: Closing covered call before close...")
+
+            exit_price = self.live_option_ask if self.live_option_ask > 0 else self.entry_credit
+            pl = round((self.entry_credit - exit_price) * 100.0 * self.position_quantity, 2)
+            if pl >= 0:
+                self.wins += 1
+            self.closing_balance += pl
+            eod_pl_msg = f"📊 EOD forced close P&L: {'+' if pl >= 0 else ''}${pl:,.2f} (bought back at ${exit_price})"
+            print(eod_pl_msg)
+            self.write_to_notepad(eod_pl_msg)
+
+            self.trigger_close_covered_call_payload()
+            self.check_global_account_risk()
+
+        if now.hour >= 16:
+            self.shutdown_engine()
+            return
+
+        self.heartbeat_count += 1
+        if self.heartbeat_count >= 60:
+            self.heartbeat_count = 0
+            status_text = "Halted" if self.system_halted else ("Call Written" if self.position_active else "Scanning Market")
+            balance_status = f"${self.starting_balance:,.2f}" if self.account_balance_ready else "awaiting account data..."
+            shares_status = f"{self.spy_shares_owned} shares" if self.shares_position_ready else "awaiting position data..."
+            print(f"💓 [HEARTBEAT {now.strftime('%I:%M %p')}] Engine online. Mode: {status_text}. Capital: {balance_status}. Shares: {shares_status}")
+
+            # Periodic reconciliation against the broker — this is what
+            # catches early assignment/exercise instead of waiting for the
+            # engine's own exit logic to eventually notice something's off.
+            if self._initial_snapshot_done:
+                self.request_position_snapshot()
+
+        threading.Timer(1.0, self.check_market_clock).start()
+
+    def tickPrice(self, reqId: int, tickType: int, price: float, attrib):
+        if price <= 0 or self.system_halted:
+            return
+
+        if reqId == 2:
+            if tickType in ASK_TICKS:
+                self.live_option_ask = price
+            elif tickType in BID_TICKS:
+                self.live_option_bid = price
+            elif tickType in CLOSE_TICKS:
+                if self.live_option_ask == 0.0:
+                    self.live_option_ask = price
+                if self.live_option_bid == 0.0:
+                    self.live_option_bid = price
+
+        if not self.account_balance_ready or not self.shares_position_ready:
+            return
+
+        if not self.has_executed and self.contract_resolved and self.live_stock_price > 0 and self.live_option_bid > 0:
+            self.evaluate_and_execute()
+        elif self.position_active and self.live_option_ask > 0:
+            self.monitor_exit_targets()
+
+    def tickOptionComputation(self, reqId, tickType, tickAttrib, impliedVol, delta,
+                               optPrice, pvDividend, gamma, vega, theta, undPrice):
+        if reqId != 2 or undPrice is None or undPrice <= 0 or self.system_halted:
+            return
+        self.live_stock_price = undPrice
+        if not self.contract_resolved:
+            self.finalize_target_contract()
+
+    def contractDetails(self, reqId: int, contractDetails):
+        if reqId == 10:
+            self.chain_contracts.append(contractDetails)
+
+    def contractDetailsEnd(self, reqId: int):
+        if reqId != 10:
+            return
+        if not self.chain_contracts:
+            warn = "⚠️ No contracts returned for the SPY chain lookup — check symbol/expiry/right are valid."
+            print(warn)
+            self.write_to_notepad(warn)
+            return
+
+        # If we already adopted an existing open position at startup, don't
+        # go hunting for a brand-new strike to probe with — just let the
+        # chain sit cached in case it's needed later once that position closes.
+        if self.contract_resolved:
+            return
+
+        self.chain_contracts.sort(key=lambda cd: cd.contract.strike)
+        probe_details = self.chain_contracts[len(self.chain_contracts) // 2]
+        self.target_option = probe_details.contract
+        msg = f"🔍 Chain loaded ({len(self.chain_contracts)} strikes). Probing with mid-chain strike ${self.target_option.strike} to locate current underlying price..."
+        print(msg)
+        self.write_to_notepad(msg)
+
+        self.reqMktData(reqId=2, contract=self.target_option, genericTickList="", snapshot=False, regulatorySnapshot=False, mktDataOptions=[])
+
+    def finalize_target_contract(self):
+        dynamic_strike = round(self.live_stock_price / 5.0) * 5.0 + self.call_otm_offset
+        match = next((cd.contract for cd in self.chain_contracts if float(cd.contract.strike) == dynamic_strike), None)
+
+        if match is None:
+            match = min(self.chain_contracts, key=lambda cd: abs(cd.contract.strike - dynamic_strike)).contract
+
+        if match.conId != self.target_option.conId:
+            self.cancelMktData(2)
+            self.target_option = match
+            msg = f"🎯 Underlying resolved at ${self.live_stock_price}. Switching subscription to OTM strike: {self.target_option.localSymbol}"
+            print(msg)
+            self.write_to_notepad(msg)
+            self.live_option_ask = 0.0
+            self.live_option_bid = 0.0
+            self.reqMktData(reqId=2, contract=self.target_option, genericTickList="", snapshot=False, regulatorySnapshot=False, mktDataOptions=[])
+        else:
+            msg = f"🎯 Underlying resolved at ${self.live_stock_price}. Probe strike {self.target_option.localSymbol} was already the OTM target."
+            print(msg)
+            self.write_to_notepad(msg)
+
+        self.contract_resolved = True
+
+    def calculate_position_size(self):
+        if self.live_option_bid <= 0:
+            return 0
+        if self.spy_shares_owned < 100:
+            return 0
+
+        share_capped_qty = self.spy_shares_owned // 100
+
+        stop_distance_per_share = self.live_option_bid * (self.stop_loss_multiple - 1.0)
+        loss_per_contract = stop_distance_per_share * 100.0
+        if loss_per_contract <= 0:
+            return share_capped_qty
+
+        dollar_risk_budget = self.closing_balance * self.risk_per_trade_pct
+        risk_based_qty = math.floor(dollar_risk_budget / loss_per_contract)
+
+        return max(0, min(share_capped_qty, risk_based_qty))
+
+    def evaluate_and_execute(self):
+        days_left = 8.0
+        interest_rate = 0.05
+        dynamic_vol = 0.22
+
+        theoretical_value = calculate_black_scholes_value(
+            self.live_stock_price, self.target_option.strike,
+            days_left, interest_rate, dynamic_vol
+        )
+
+        if self.live_option_bid > theoretical_value:
+            quantity = self.calculate_position_size()
+            if quantity < 1:
+                skip_msg = (
+                    f"⏭️ SIGNAL FOUND but sized to 0 contracts "
+                    f"(shares owned: {self.spy_shares_owned}, risk budget ${self.closing_balance * self.risk_per_trade_pct:,.2f} "
+                    f"vs bid ${self.live_option_bid}). Skipping."
+                )
+                print(skip_msg)
+                self.write_to_notepad(skip_msg)
+                return
+
+            self.has_executed = True
+            alert = (
+                f"💥 COVERED CALL SIGNAL! SPY Stock: ${self.live_stock_price} | Strike: ${self.target_option.strike} | "
+                f"Option Bid: ${self.live_option_bid} | Fair Value: ${theoretical_value} | Writing: {quantity} contract(s)"
+            )
+            print(f"\n{alert}")
+            self.write_to_notepad(alert)
+            self.trigger_open_covered_call_payload(quantity)
+
+    def trigger_open_covered_call_payload(self, quantity):
+        self.write_to_notepad(f"ORDER ROUTING: Selling {quantity} covered call contract(s) to open...")
+        sell_to_open = Order()
+        sell_to_open.action = "SELL"
+        sell_to_open.orderType = "LMT"
+        sell_to_open.totalQuantity = quantity
+        sell_to_open.lmtPrice = self.live_option_bid
+        sell_to_open.transmit = True
+        sell_to_open.eTradeOnly = False
+        sell_to_open.firmQuoteOnly = False
+
+        order_id = self.next_order_id
+        self.order_intents[order_id] = "OPEN"
+        self.placeOrder(order_id, self.target_option, sell_to_open)
+
+    def orderStatus(self, orderId: int, status: str, filled: float, remaining: float, avgFillPrice: float, permId: int, parentId: int, lastFillPrice: float, clientId: int, whyHeld: str, mktCapPrice: float):
+        if status != "Filled":
+            return
+
+        intent = self.order_intents.get(orderId)
+
+        if intent == "OPEN" and not self.position_active:
+            self.position_active = True
+            self.entry_credit = avgFillPrice
+            self.position_quantity = int(filled)
+            self.take_profit_target = round(self.entry_credit * self.take_profit_pct, 2)
+            self.stop_loss_target = round(self.entry_credit * self.stop_loss_multiple, 2)
+            self.total_trades += 1
+
+            fill_msg = (
+                f"📦 COVERED CALL WRITTEN! Qty: {self.position_quantity} | Credit Received: ${self.entry_credit} | "
+                f"Buy-back TP: ${self.take_profit_target} | Buy-back SL: ${self.stop_loss_target}"
+            )
+            print(f"\n{fill_msg}")
+            self.write_to_notepad(fill_msg)
+
+        elif intent == "CLOSE":
+            close_msg = f"🏁 Buy-to-close confirmed filled at ${avgFillPrice} for {int(filled)} contract(s)."
+            print(close_msg)
+            self.write_to_notepad(close_msg)
+
+    def monitor_exit_targets(self):
+        if self.live_option_ask <= self.take_profit_target:
+            self.position_active = False
+            msg = f"💰 TAKE PROFIT: Buy-back ask ${self.live_option_ask} <= Target ${self.take_profit_target}"
+            print(f"\n{msg}")
+            self.write_to_notepad(msg)
+            self.wins += 1
+
+            trade_gain = round((self.entry_credit - self.live_option_ask) * 100.0 * self.position_quantity, 2)
+            self.closing_balance += trade_gain
+            self.trigger_close_covered_call_payload()
+            self.check_global_account_risk()
+
+        elif self.live_option_ask >= self.stop_loss_target:
+            self.position_active = False
+            msg = f"⚠️ STOP LOSS: Buy-back ask ${self.live_option_ask} >= Target ${self.stop_loss_target}"
+            print(f"\n{msg}")
+            self.write_to_notepad(msg)
+
+            trade_loss = round((self.live_option_ask - self.entry_credit) * 100.0 * self.position_quantity, 2)
+            self.closing_balance -= trade_loss
+            self.trigger_close_covered_call_payload()
+            self.check_global_account_risk()
+
+    def check_global_account_risk(self):
+        current_net_change_pct = (self.closing_balance - self.starting_balance) / self.starting_balance
+
+        if current_net_change_pct <= -self.max_daily_drawdown_pct:
+            self.system_halted = True
+            halt_msg = f"🚨 RISK EMERGENCY: MAXIMUM DRAWDOWN BREACHED ({current_net_change_pct*100:.1f}%). TRADING HALTED."
+            print(f"\n{halt_msg}")
+            self.write_to_notepad(halt_msg)
+
+        elif current_net_change_pct >= self.max_daily_markup_pct:
+            self.system_halted = True
+            halt_msg = f"📈 TARGET ACHIEVED: MAXIMUM DAILY MARKUP REACHED (+{current_net_change_pct*100:.1f}%). LOCKING IN PROFIT."
+            print(f"\n{halt_msg}")
+            self.write_to_notepad(halt_msg)
+
+    def trigger_close_covered_call_payload(self):
+        self.next_order_id += 1
+        self.write_to_notepad(f"ORDER ROUTING: Buying to close {self.position_quantity} contract(s)...")
+        buy_to_close = Order()
+        buy_to_close.action = "BUY"
+        buy_to_close.orderType = "MKT"
+        buy_to_close.totalQuantity = self.position_quantity
+        buy_to_close.transmit = True
+        buy_to_close.eTradeOnly = False
+        buy_to_close.firmQuoteOnly = False
+
+        order_id = self.next_order_id
+        self.order_intents[order_id] = "CLOSE"
+        self.placeOrder(order_id, self.target_option, buy_to_close)
+        print("🏁 Buy-to-close transaction submitted.")
+        self.position_quantity = 0
+
+    def write_to_notepad(self, text_to_log):
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted_line = f"[{timestamp}] {text_to_log}\n"
+        with open(TRADE_LOG_PATH, "a", encoding="utf-8") as file:
+            file.write(formatted_line)
+
+    def shutdown_engine(self):
+        win_rate = (self.wins / self.total_trades * 100.0) if self.total_trades > 0 else 0.0
+        net_pl = round(self.closing_balance - self.starting_balance, 2)
+        pl_prefix = "+" if net_pl >= 0 else ""
+
+        self.append_todays_session()
+
+        lifetime_trades = sum(s["trades"] for s in self.session_history)
+        lifetime_wins = sum(s["wins"] for s in self.session_history)
+        lifetime_win_rate = (lifetime_wins / lifetime_trades * 100.0) if lifetime_trades > 0 else 0.0
+
+        summary_block = (
+            "\n==================================================\n"
+            "🗒️ --- FINAL END-OF-DAY PERFORMANCE SUMMARY ---\n"
+            f"📅 Session Date: {datetime.datetime.now().strftime('%Y-%m-%d')}\n"
+            f"📦 Total Trades Executed Today: {self.total_trades}\n"
+            f"💰 Starting Cash (from account): ${self.starting_balance:,.2f}\n"
+            f"📈 Closing Cash (est.): ${self.closing_balance:,.2f}\n"
+            f"🟢 Net Profit/Loss Today: {pl_prefix}${net_pl:,.2f}\n"
+            f"🌟 Today's Win Rate: {win_rate:.1f}%\n"
+            f"📚 Lifetime Trades Logged: {lifetime_trades} | Lifetime Win Rate: {lifetime_win_rate:.1f}%\n"
+            "=================================================="
+        )
+        print(summary_block)
+        self.write_to_notepad(summary_block)
+        self.cancelMktData(2)
+        self.disconnect()
+
+# Launch covered-call engine
+try:
+    engine = CoveredCallEngine()
+    engine.connect("127.0.0.1", 7497, clientId=8157)
+    engine.run()
+except KeyboardInterrupt:
+    print("\n🛑 Session manually aborted.")
+    sys.exit()
