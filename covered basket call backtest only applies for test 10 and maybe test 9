@@ -1,0 +1,472 @@
+"""
+COVERED-CALL / BUY-WRITE BACKTESTER (educational, not a broker-grade simulator)
+================================================================================
+Backtest window: 2022-07-05 -> 2026-09-11
+
+READ THIS BEFORE TRUSTING ANY NUMBER THIS PRINTS:
+
+1. IBKR's API does not provide historical bid/ask quotes for expired option
+   contracts. There is no way to pull "what did the SPY $780 call actually
+   trade at on 2023-03-03" from reqHistoricalData. So option prices in this
+   backtest are NOT real historical quotes — they are Black-Scholes model
+   prices, using a rolling REALIZED volatility computed from the underlying's
+   own daily returns (since historical implied vol for expired chains isn't
+   available either). Real option prices differ from BS-modeled prices in
+   ways that matter (skew, term structure, supply/demand for that specific
+   strike) — this is a real, structural limitation, not a bug to fix later.
+
+2. Strikes are theoretical (rounded to the OTM target price), not real listed
+   strike increments, because there's no historical chain to snap to.
+
+3. Not modeled at all: commissions, slippage, bid/ask spread on fills,
+   dividends (covered calls forgo dividend upside risk on assignment),
+   early assignment (American-style options can be assigned before expiry —
+   this only checks assignment AT simulated expiry).
+
+4. Existing open positions are still monitored/closed even on a day the
+   daily risk breaker trips — only NEW position entries are blocked that
+   day. This is a deliberate, more conservative choice than the live engine
+   (which halts everything, including managing what's already open).
+
+Use this to sanity-check strategy RULES (OTM offset, take-profit/stop-loss
+thresholds, position sizing), not as a promise of real-world P&L.
+"""
+
+import sys
+import os
+import json
+import math
+import csv
+import time
+import statistics
+from datetime import date, timedelta
+
+from ibapi.client import EClient
+from ibapi.wrapper import EWrapper
+from ibapi.contract import Contract
+
+# =====================================================================
+# CONFIG
+# =====================================================================
+BACKTEST_START = date(2022, 7, 5)
+BACKTEST_END = date(2026, 9, 11)
+
+VOL_WARMUP_CALENDAR_DAYS = 60     # extra history fetched before BACKTEST_START so realized vol exists on day 1
+REALIZED_VOL_WINDOW = 20          # trading days used for the rolling annualized volatility proxy
+RISK_FREE_RATE = 0.05
+
+STARTING_CAPITAL = 2_400_000.0  # lump cash sum, per user request, treated as available on 7/5/2022
+MAX_CONCURRENT_POSITIONS = 5
+NEW_POSITION_CAPITAL_PCT = 0.05
+OTM_OFFSET_PCT = 0.02
+EXPIRY_CALENDAR_DAYS = 30
+TRADING_DAYS_PER_CALENDAR_DAY = 1 / 1.45   # rough US-market trading-day density, used to convert calendar-day expiry to a bar index offset
+
+TAKE_PROFIT_PCT = 0.50
+STOP_LOSS_MULTIPLE = 2.0
+MAX_DAILY_DRAWDOWN_PCT = 0.02
+MAX_DAILY_MARKUP_PCT = 0.03
+
+CANDIDATE_UNIVERSE = {
+    "index_etf":     ["SPY", "QQQ", "IWM"],
+    "sector_etf":    ["XLK", "XLF", "XLE", "XLV", "XLY"],
+    "single_stock":  ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA"],
+    "leveraged_etf": ["TQQQ", "SPXL", "SOXL", "UPRO"],
+}
+
+DATA_CACHE_PATH = r"C:\Users\Brandon.R\backtest_price_cache.json"
+TRADE_LOG_CSV_PATH = r"C:\Users\Brandon.R\backtest_trade_log.csv"
+EQUITY_CURVE_CSV_PATH = r"C:\Users\Brandon.R\backtest_equity_curve.csv"
+
+
+# =====================================================================
+# BLACK-SCHOLES (same math as the live engine)
+# =====================================================================
+def pure_python_norm_cdf(x):
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+
+def calculate_black_scholes_value(stock_price, strike, days_to_expiry, risk_free_rate, volatility):
+    if stock_price <= 0 or strike <= 0 or days_to_expiry <= 0 or volatility <= 0:
+        return 0.0
+    T = days_to_expiry / 365.0
+    d1 = (math.log(stock_price / strike) + (risk_free_rate + 0.5 * volatility ** 2) * T) / (volatility * math.sqrt(T))
+    d2 = d1 - volatility * math.sqrt(T)
+    call_price = stock_price * pure_python_norm_cdf(d1) - strike * math.exp(-risk_free_rate * T) * pure_python_norm_cdf(d2)
+    return round(call_price, 4)
+
+
+# =====================================================================
+# STAGE 1: HISTORICAL DATA DOWNLOAD (the only part that touches IBKR)
+# =====================================================================
+class HistoricalDataDownloader(EWrapper, EClient):
+    """Fetches daily close bars per symbol, chunked into ~1-year windows to
+    stay well inside IB's historical-data pacing limits, requested
+    sequentially (never more than one request in flight)."""
+
+    def __init__(self, symbols, range_start, range_end):
+        EClient.__init__(self, self)
+        self.bars = {sym: [] for sym in symbols}
+        self._reqid_to_symbol = {}
+        self._reqid_counter = 5000
+        self.request_queue = self._build_request_queue(symbols, range_start, range_end)
+
+    def _build_request_queue(self, symbols, range_start, range_end):
+        queue = []
+        for sym in symbols:
+            chunk_end = range_end
+            chunks = []
+            while chunk_end > range_start:
+                # IB requires duration strings over 365 days to use year units
+                # instead of day units ("1 Y" not "367 D"). Keep every
+                # day-unit chunk safely under that ceiling.
+                chunk_start = max(range_start, chunk_end - timedelta(days=350))
+                chunks.append((sym, chunk_start, chunk_end))
+                chunk_end = chunk_start - timedelta(days=1)
+            chunks.reverse()  # oldest chunk first, for readable console order
+            queue.extend(chunks)
+        return queue
+
+    def nextValidId(self, orderId):
+        self._fire_next_request()
+
+    def _fire_next_request(self):
+        if not self.request_queue:
+            print("✅ All historical data requests complete.")
+            self.disconnect()
+            return
+
+        sym, chunk_start, chunk_end = self.request_queue.pop(0)
+        contract = Contract()
+        contract.symbol = sym
+        contract.secType = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+
+        reqid = self._reqid_counter
+        self._reqid_counter += 1
+        self._reqid_to_symbol[reqid] = sym
+
+        end_str = chunk_end.strftime("%Y%m%d") + " 23:59:59 US/Eastern"
+        duration_days = min((chunk_end - chunk_start).days + 2, 365)
+        duration_str = f"{duration_days} D"
+
+        print(f"📥 Requesting {sym} bars {chunk_start} -> {chunk_end} ...")
+        self.reqHistoricalData(reqid, contract, end_str, duration_str, "1 day", "TRADES", 1, 1, False, [])
+
+    def historicalData(self, reqId, bar):
+        sym = self._reqid_to_symbol.get(reqId)
+        if sym:
+            self.bars[sym].append({"date": bar.date[:8], "close": bar.close})
+
+    def historicalDataEnd(self, reqId, start, end):
+        sym = self._reqid_to_symbol.get(reqId, "?")
+        print(f"✅ {sym}: chunk complete ({start} -> {end}).")
+        time.sleep(1.0)  # small pacing cushion between sequential requests
+        self._fire_next_request()
+
+    BENIGN_INFO_CODES = {1100, 1101, 1102, 2103, 2104, 2105, 2106, 2107, 2108, 2119, 2137, 2158}
+
+    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
+        if errorCode in self.BENIGN_INFO_CODES:
+            return
+        print(f"⚠️ IB ERROR [{reqId}] {errorCode}: {errorString}")
+
+
+def download_historical_data(symbols, range_start, range_end):
+    downloader = HistoricalDataDownloader(symbols, range_start, range_end)
+    downloader.connect("127.0.0.1", 7497, clientId=8501)
+    downloader.run()
+    return downloader.bars
+
+
+def load_or_download_bars(symbols):
+    if os.path.exists(DATA_CACHE_PATH):
+        try:
+            with open(DATA_CACHE_PATH, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if all(sym in cached and len(cached[sym]) > 0 for sym in symbols):
+                print("📂 Using cached historical bars (delete the cache file to force a re-download).")
+                return cached
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    buffered_start = BACKTEST_START - timedelta(days=VOL_WARMUP_CALENDAR_DAYS)
+    print("🌐 No usable cache found — connecting to TWS/Gateway to download historical bars...")
+    print("   (TWS or IB Gateway must be running and logged in for this step.)")
+    bars = download_historical_data(symbols, buffered_start, BACKTEST_END)
+    with open(DATA_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(bars, f)
+    return bars
+
+
+# =====================================================================
+# STAGE 2: OFFLINE SIMULATION (no IBKR connection needed from here on)
+# =====================================================================
+def compute_realized_vol_series(closes):
+    """Rolling REALIZED_VOL_WINDOW-day annualized volatility from daily log
+    returns. This is the proxy standing in for implied volatility, which
+    IBKR does not provide historically for expired option chains."""
+    vols = [None] * len(closes)
+    for i in range(REALIZED_VOL_WINDOW, len(closes)):
+        window = closes[i - REALIZED_VOL_WINDOW:i + 1]
+        rets = [
+            math.log(window[j] / window[j - 1])
+            for j in range(1, len(window))
+            if window[j - 1] > 0 and window[j] > 0
+        ]
+        if len(rets) < 2:
+            continue
+        stdev = statistics.pstdev(rets)
+        vols[i] = stdev * math.sqrt(252)
+    return vols
+
+
+class PositionState:
+    def __init__(self):
+        self.active = False
+        self.shares = 0
+        self.cost_basis_per_share = 0.0
+        self.strike = 0.0
+        self.entry_credit = 0.0
+        self.expiry_day_index = 0
+        self.contracts = 0
+
+
+class CoveredCallBacktester:
+    def __init__(self, price_data):
+        self.price_data = price_data
+        self.symbol_series = {}
+        self.symbol_vol = {}
+        self.positions = {sym: PositionState() for sym in price_data}
+        self.cash = STARTING_CAPITAL
+        self.trade_log = []
+        self.equity_curve = []
+        self._prepare_series()
+
+    def _prepare_series(self):
+        for sym, bars in self.price_data.items():
+            bars_sorted = sorted(bars, key=lambda b: b["date"])
+            closes = [b["close"] for b in bars_sorted]
+            dates = [b["date"] for b in bars_sorted]
+            vols = compute_realized_vol_series(closes)
+            self.symbol_series[sym] = list(zip(dates, closes))
+            self.symbol_vol[sym] = vols
+
+    def run(self):
+        start_str = BACKTEST_START.strftime("%Y%m%d")
+        end_str = BACKTEST_END.strftime("%Y%m%d")
+
+        master_dates = sorted({
+            d for sym in self.symbol_series for d, _ in self.symbol_series[sym]
+            if start_str <= d <= end_str
+        })
+        idx_lookup = {
+            sym: {d: i for i, (d, _) in enumerate(self.symbol_series[sym])}
+            for sym in self.symbol_series
+        }
+
+        if not master_dates:
+            print("⚠️ No trading days found in the requested window — check the cached data.")
+            return
+
+        start_of_day_equity = self.cash
+
+        for day_str in master_dates:
+            # ---- 1. Manage existing positions (runs even on a halted day) ----
+            for sym, pos in self.positions.items():
+                if not pos.active or day_str not in idx_lookup[sym]:
+                    continue
+                series = self.symbol_series[sym]
+                i = idx_lookup[sym][day_str]
+                _, close = series[i]
+                vol = self.symbol_vol[sym][i] or 0.20
+
+                trading_days_left = max(pos.expiry_day_index - i, 0)
+                calendar_days_left = max(trading_days_left / TRADING_DAYS_PER_CALENDAR_DAY, 0.5)
+                theo_price = calculate_black_scholes_value(close, pos.strike, calendar_days_left, RISK_FREE_RATE, vol)
+
+                closed_early = False
+                if theo_price <= pos.entry_credit * TAKE_PROFIT_PCT:
+                    pnl = (pos.entry_credit - theo_price) * 100 * pos.contracts
+                    self._close_position(sym, day_str, theo_price, pnl, "TAKE_PROFIT")
+                    closed_early = True
+                elif theo_price >= pos.entry_credit * STOP_LOSS_MULTIPLE:
+                    pnl = (pos.entry_credit - theo_price) * 100 * pos.contracts
+                    self._close_position(sym, day_str, theo_price, pnl, "STOP_LOSS")
+                    closed_early = True
+
+                if not closed_early and i >= pos.expiry_day_index:
+                    if close >= pos.strike:
+                        proceeds = pos.strike * pos.shares
+                        self.cash += proceeds
+                        capital_gain = (pos.strike - pos.cost_basis_per_share) * pos.shares
+                        self._log_trade(sym, day_str, "ASSIGNED", pos.contracts, pos.strike, pos.entry_credit, capital_gain)
+                        pos.active = False
+                        pos.shares = 0
+                    else:
+                        self._log_trade(
+                            sym, day_str, "EXPIRED_WORTHLESS", pos.contracts, pos.strike,
+                            pos.entry_credit, pos.entry_credit * 100 * pos.contracts
+                        )
+                        pos.active = False  # shares retained; eligible to roll a new call below
+
+            # ---- 2. Daily risk breaker check ----
+            current_equity = self._mark_to_market(day_str, idx_lookup)
+            halted_today = False
+            if start_of_day_equity > 0:
+                change_pct = (current_equity - start_of_day_equity) / start_of_day_equity
+                if change_pct <= -MAX_DAILY_DRAWDOWN_PCT or change_pct >= MAX_DAILY_MARKUP_PCT:
+                    halted_today = True
+
+            # ---- 3. New-position / roll scan (blocked on a halted day) ----
+            if not halted_today:
+                open_count = sum(1 for p in self.positions.values() if p.active)
+                if open_count < MAX_CONCURRENT_POSITIONS:
+                    candidates = []
+                    for sym, pos in self.positions.items():
+                        if pos.active or day_str not in idx_lookup[sym]:
+                            continue
+                        series = self.symbol_series[sym]
+                        i = idx_lookup[sym][day_str]
+                        _, close = series[i]
+                        vol = self.symbol_vol[sym][i]
+                        if vol is None or close <= 0:
+                            continue
+                        strike = round(close * (1 + OTM_OFFSET_PCT), 2)
+                        theo = calculate_black_scholes_value(close, strike, EXPIRY_CALENDAR_DAYS, RISK_FREE_RATE, vol)
+                        annualized_yield = (theo / close) * (365.0 / EXPIRY_CALENDAR_DAYS) if close > 0 else 0
+                        if theo > 0:
+                            candidates.append((sym, i, close, strike, theo, annualized_yield))
+                    candidates.sort(key=lambda c: c[5], reverse=True)
+
+                    for sym, i, close, strike, theo, ayield in candidates:
+                        if open_count >= MAX_CONCURRENT_POSITIONS:
+                            break
+                        pos = self.positions[sym]
+                        series = self.symbol_series[sym]
+                        approx_trading_day_offset = max(int(EXPIRY_CALENDAR_DAYS * TRADING_DAYS_PER_CALENDAR_DAY), 1)
+                        expiry_idx = min(i + approx_trading_day_offset, len(series) - 1)
+
+                        if pos.shares > 0:
+                            # ROLLING: shares already owned from a prior expired-worthless
+                            # cycle — just write a new call, no new share purchase.
+                            contracts = pos.shares // 100
+                            if contracts < 1:
+                                continue
+                            credit = theo * 100 * contracts
+                            self.cash += credit
+                            pos.active = True
+                            pos.strike = strike
+                            pos.entry_credit = theo
+                            pos.expiry_day_index = expiry_idx
+                            pos.contracts = contracts
+                            self._log_trade(sym, day_str, "ROLL_NEW_CALL", contracts, strike, theo, credit)
+                        else:
+                            # NEW BUY-WRITE
+                            allocation = min(current_equity * NEW_POSITION_CAPITAL_PCT, self.cash)
+                            shares_affordable = int(allocation // (close * 100)) * 100
+                            if shares_affordable < 100:
+                                continue
+                            contracts = shares_affordable // 100
+                            cost = shares_affordable * close
+                            credit = theo * 100 * contracts
+                            self.cash -= cost
+                            self.cash += credit
+                            pos.active = True
+                            pos.shares = shares_affordable
+                            pos.cost_basis_per_share = close
+                            pos.strike = strike
+                            pos.entry_credit = theo
+                            pos.expiry_day_index = expiry_idx
+                            pos.contracts = contracts
+                            self._log_trade(sym, day_str, "OPEN_BUY_WRITE", contracts, strike, theo, credit - cost)
+
+                        open_count += 1
+
+            final_equity = self._mark_to_market(day_str, idx_lookup)
+            self.equity_curve.append((day_str, round(final_equity, 2)))
+            start_of_day_equity = final_equity
+
+        self._write_outputs()
+        self._print_summary()
+
+    def _mark_to_market(self, day_str, idx_lookup):
+        total = self.cash
+        for sym, pos in self.positions.items():
+            if pos.shares > 0 and day_str in idx_lookup[sym]:
+                i = idx_lookup[sym][day_str]
+                _, close = self.symbol_series[sym][i]
+                total += pos.shares * close
+        return total
+
+    def _close_position(self, sym, day_str, buyback_price, pnl, reason):
+        pos = self.positions[sym]
+        self.cash -= buyback_price * 100 * pos.contracts
+        self._log_trade(sym, day_str, reason, pos.contracts, pos.strike, pos.entry_credit, pnl)
+        pos.active = False  # shares retained
+
+    def _log_trade(self, sym, day_str, event, contracts, strike, credit_or_debit, pnl):
+        self.trade_log.append({
+            "date": day_str, "symbol": sym, "event": event, "contracts": contracts,
+            "strike": strike, "credit_or_debit": round(credit_or_debit, 4), "pnl": round(pnl, 2),
+        })
+
+    def _write_outputs(self):
+        with open(TRADE_LOG_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["date", "symbol", "event", "contracts", "strike", "credit_or_debit", "pnl"])
+            writer.writeheader()
+            writer.writerows(self.trade_log)
+        with open(EQUITY_CURVE_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["date", "equity"])
+            writer.writerows(self.equity_curve)
+
+    def _print_summary(self):
+        if not self.equity_curve:
+            print("⚠️ No equity curve generated — check that historical data actually loaded.")
+            return
+
+        final_equity = self.equity_curve[-1][1]
+        total_return_pct = (final_equity - STARTING_CAPITAL) / STARTING_CAPITAL * 100
+        years = (BACKTEST_END - BACKTEST_START).days / 365.25
+        cagr = ((final_equity / STARTING_CAPITAL) ** (1 / years) - 1) * 100 if years > 0 and final_equity > 0 else 0.0
+
+        peak = STARTING_CAPITAL
+        max_dd = 0.0
+        for _, eq in self.equity_curve:
+            peak = max(peak, eq)
+            if peak > 0:
+                max_dd = max(max_dd, (peak - eq) / peak)
+
+        close_events = ("TAKE_PROFIT", "STOP_LOSS", "ASSIGNED", "EXPIRED_WORTHLESS")
+        closes = [t for t in self.trade_log if t["event"] in close_events]
+        wins = sum(1 for t in closes if t["pnl"] > 0)
+        win_rate = (wins / len(closes) * 100) if closes else 0.0
+
+        print("\n================= BACKTEST SUMMARY =================")
+        print(f"Period: {BACKTEST_START} -> {BACKTEST_END}  (model-priced options, not real quotes)")
+        print(f"Starting Capital: ${STARTING_CAPITAL:,.2f}")
+        print(f"Final Equity:     ${final_equity:,.2f}")
+        print(f"Total Return:     {total_return_pct:+.1f}%")
+        print(f"CAGR:             {cagr:+.1f}%")
+        print(f"Max Drawdown:     {max_dd*100:.1f}%")
+        print(f"Positions Closed: {len(closes)} | Win Rate: {win_rate:.1f}%")
+        print(f"Trade log  -> {TRADE_LOG_CSV_PATH}")
+        print(f"Equity curve -> {EQUITY_CURVE_CSV_PATH}")
+        print("======================================================")
+
+
+def main():
+    symbols = sorted({s for cat in CANDIDATE_UNIVERSE.values() for s in cat})
+    bars = load_or_download_bars(symbols)
+    backtester = CoveredCallBacktester(bars)
+    backtester.run()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n🛑 Backtest manually aborted.")
+        sys.exit()
